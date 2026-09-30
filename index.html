@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multiplayer Circle Game</title>
+    <script src="https://unpkg.com"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #222;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: sans-serif;
+            overflow: hidden;
+            color: white;
+        }
+        #lobby {
+            margin-bottom: 10px;
+            background: rgba(0,0,0,0.5);
+            padding: 10px;
+            border-radius: 5px;
+            text-align: center;
+        }
+        input, button {
+            padding: 8px;
+            font-size: 14px;
+            border-radius: 4px;
+            border: none;
+            margin: 2px;
+        }
+        button {
+            background-color: #28a745;
+            color: white;
+            cursor: pointer;
+        }
+        canvas {
+            background-color: #808080;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            display: block;
+        }
+    </style>
+</head>
+<body>
+
+<div id="lobby">
+    <div id="setup-status">Connecting to network...</div>
+    <div id="controls" style="display:none;">
+        <span>Your ID: <span id="my-id" style="color: #00ffcc; font-weight: bold;">Loading...</span></span>
+        <input type="text" id="join-id" placeholder="Enter Friend's ID">
+        <button id="connect-btn">Connect & Play</button>
+    </div>
+</div>
+
+<canvas id="gameCanvas" width="800" height="600"></canvas>
+
+<script>
+const canvas = document.getElementById("gameCanvas");
+const ctx = canvas.getContext("2d");
+
+const keys = {};
+window.addEventListener("keydown", e => keys[e.code] = true);
+window.addEventListener("keyup", e => keys[e.code] = false);
+
+window.addEventListener("mousedown", () => {
+    if (isGameRunning && myPlayer) myPlayer.attack();
+});
+
+let peer = null, conn = null, isHost = false, isGameRunning = false;
+let myPlayer = null, remotePlayer = null, enemies = [], enemySpawnTimer = 0;
+
+class Player {
+    constructor(x, y, id) {
+        this.x = x; this.y = y; this.radius = 20; this.speed = 4; this.hp = 100; this.id = id;
+        this.isAttacking = false; this.attackRadius = 0; this.maxAttackRadius = 38;
+        this.isBlocking = false; this.dashCooldown = 0; this.dashTimer = 0; this.dashVx = 0; this.dashVy = 0;
+    }
+    updateLocal() {
+        if (this.dashCooldown > 0) this.dashCooldown--;
+        
+        if (this.dashTimer > 0) {
+            this.x += this.dashVx; this.y += this.dashVy; this.dashTimer--;
+        } else {
+            if (keys["KeyF"]) {
+                this.isBlocking = true; 
+                this.isAttacking = false; // can't move or attack while blocking
+            } else {
+                this.isBlocking = false;
+                let moveX = 0, moveY = 0;
+                if (keys["KeyW"]) moveY = -1; if (keys["KeyS"]) moveY = 1;
+                if (keys["KeyA"]) moveX = -1; if (keys["KeyD"]) moveX = 1;
+                
+                if (moveX !== 0 || moveY !== 0) {
+                    const len = Math.hypot(moveX, moveY);
+                    this.x += (moveX / len) * this.speed; this.y += (moveY / len) * this.speed;
+                }
+                if (keys["KeyQ"] && this.dashCooldown === 0 && (moveX !== 0 || moveY !== 0)) {
+                    const len = Math.hypot(moveX, moveY);
+                    this.dashVx = (moveX / len) * 15; this.dashVy = (moveY / len) * 15;
+                    this.dashTimer = 10; this.dashCooldown = 360; // 6 seconds at 60fps
+                }
+            }
+        }
+        this.x = Math.max(this.radius, Math.min(canvas.width - this.radius, this.x));
+        this.y = Math.max(this.radius, Math.min(canvas.height - this.radius, this.y));
+        
+        if (this.isAttacking) {
+            this.attackRadius += 2;
+            if (this.attackRadius >= this.maxAttackRadius) { this.isAttacking = false; this.attackRadius = 0; }
+        }
+    }
+    attack() {
+        if (!this.isBlocking && !this.isAttacking) { this.isAttacking = true; this.attackRadius = this.radius; }
+    }
+    draw(label) {
+        // Red circle behind expanding a tiny bit for m1
+        if (this.isAttacking) {
+            ctx.beginPath(); ctx.arc(this.x, this.y, this.attackRadius, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(255, 0, 0, 0.6)"; ctx.fill();
+        }
+        // Same thing but blue for blocking
+        if (this.isBlocking) {
+            ctx.beginPath(); ctx.arc(this.x, this.y, this.radius + 12, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(0, 0, 255, 0.6)"; ctx.fill();
+        }
+        // Player circle: white with black border
+        ctx.beginPath(); ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+        ctx.fillStyle = "#ffffff"; ctx.fill();
+        ctx.lineWidth = 3; ctx.strokeStyle = "#000000"; ctx.stroke();
+        
+        ctx.fillStyle = "#fff"; ctx.font = "12px Arial"; ctx.textAlign = "center";
+        const cdText = this.dashCooldown > 0 ? `Q: ${Math.ceil(this.dashCooldown / 60)}s` : "Q: READY";
+        ctx.fillText(`${label} HP: ${Math.floor(this.hp)} | ${cdText}`, this.x, this.y - 32);
+    }
+}
+
+class Enemy {
+    constructor(id, x, y) {
+        this.id = id; this.radius = 15; this.speed = 1.5;
+        this.x = x || Math.random() * (canvas.width - this.radius * 2) + this.radius;
+        this.y = y || Math.random() * (canvas.height - this.radius * 2) + this.radius;
+    }
+    update(p1, p2) {
+        let target = p1;
+        if (p1.hp <= 0) target = p2;
+        else if (p2.hp > 0 && Math.hypot(this.x - p2.x, this.y - p2.y) < Math.hypot(this.x - p1.x, this.y - p1.y)) target = p2;
+        if (target && target.hp > 0) {
+            const dx = target.x - this.x, dy = target.y - this.y, dist = Math.hypot(dx, dy);
+            if (dist > 0) { this.x += (dx / dist) * this.speed; this.y += (dy / dist) * this.speed; }
+        }
+    }
+    draw() {
+        ctx.beginPath(); ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+        ctx.fillStyle = "#ff0000"; ctx.fill();
+        ctx.lineWidth = 2; ctx.strokeStyle = "#000"; ctx.stroke();
+    }
+}
+
+peer = new Peer();
+peer.on('open', (id) => {
+    document.getElementById("setup-status").style.display = "none";
+    document.getElementById("my-id").innerText = id;
+    document.getElementById("controls").style.display = "block";
+});
+peer.on('connection', (connection) => {
+    if (conn) return; conn = connection; isHost = true; setupGameSession();
+});
+document.getElementById("connect-btn").addEventListener("click", () => {
+    const targetId = document.getElementById("join-id").value.trim();
+    if (targetId) { conn = peer.connect(targetId); isHost = false; setupGameSession(); }
+});
+
+function setupGameSession() {
+    document.getElementById("lobby").style.display = "none";
+    conn.on('open', () => {
+        if (isHost) { myPlayer = new Player(200, 300, 1); remotePlayer = new Player(600, 300, 2); } 
+        else { myPlayer = new Player(600, 300, 2); remotePlayer = new Player(200, 300, 1); }
+        isGameRunning = true; gameLoop();
+    });
+    conn.on('data', (data) => {
+        if (data.type === 'playerUpdate') {
+            remotePlayer.x = data.x; remotePlayer.y = data.y;
+            remotePlayer.isAttacking = data.isAttacking; remotePlayer.attackRadius = data.attackRadius;
+            remotePlayer.isBlocking = data.isBlocking; remotePlayer.hp = data.hp;
+        } else if (data.type === 'enemySync' && !isHost) {
+            enemies = data.enemies.map(e => new Enemy(e.id, e.x, e.y));
+        } else if (data.type === 'hpUpdate' && isHost) { remotePlayer.hp = data.hp; }
+    });
+}
+
+function gameLoop() {
+    if (!isGameRunning) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (myPlayer.hp > 0) myPlayer.updateLocal();
+    conn.send({
+        type: 'playerUpdate', x: myPlayer.x, y: myPlayer.y,
+        isAttacking: myPlayer.isAttacking, attackRadius: myPlayer.attackRadius,
+        isBlocking: myPlayer.isBlocking, hp: myPlayer.hp
+    });
+    if (isHost) {
+        enemySpawnTimer++;
+        if (enemySpawnTimer > 120) { enemies.push(new Enemy(Date.now() + Math.random())); enemySpawnTimer = 0; }
+        for (let i = enemies.length - 1; i >= 0; i--) {
+            let enemy = enemies[i]; enemy.update(myPlayer, remotePlayer);
+            [myPlayer, remotePlayer].forEach(p => {
+                if (p.hp <= 0) return;
+                if (p.isAttacking && Math.hypot(enemy.x - p.x, enemy.y - p.y) < enemy.radius + p.attackRadius) { enemies.splice(i, 1); }
+                else if (Math.hypot(enemy.x - p.x, enemy.y - p.y) < enemy.radius + p.radius) {
+                    if (p.isBlocking) { enemy.x += (enemy.x - p.x) * 0.5; enemy.y += (enemy.y - p.y) * 0.5; } 
+                    else { p.hp -= 4; enemies.splice(i, 1); }
+                }
+            });
+        }
+        conn.send({ type: 'enemySync', enemies: enemies.map(e => ({ id: e.id, x: e.x, y: e.y })) });
+    } else { conn.send({ type: 'hpUpdate', hp: myPlayer.hp }); }
+    
+    if (isHost) { if (myPlayer.hp > 0) myPlayer.draw("P1 (You)"); if (remotePlayer.hp > 0) remotePlayer.draw("P2"); } 
+    else { if (remotePlayer.hp > 0) remotePlayer.draw("P1"); if (myPlayer.hp > 0) myPlayer.draw("P2 (You)"); }
+    enemies.forEach(e => e.draw());
+
+    if (myPlayer.hp <= 0 && remotePlayer.hp <= 0) {
+        ctx.fillStyle = "rgba(0,0,0,0.8)"; ctx.fillRect(0,0,canvas.width, canvas.height);
+        ctx.fillStyle = "#ff0000"; ctx.font = "40px Arial"; ctx.textAlign = "center";
+        ctx.fillText("GAME OVER", canvas.width/2, canvas.height/2);
+    }
+    requestAnimationFrame(gameLoop);
+}
+</script>
+</body>
+</html>
